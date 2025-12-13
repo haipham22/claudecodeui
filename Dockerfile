@@ -2,7 +2,11 @@
 FROM node:22-alpine AS base
 
 # Install build dependencies
-RUN apk add --no-cache python3 make g++
+RUN apk add --no-cache python3 make g++ git openssh-client
+
+# Set up MCP detection and TaskMaster support (packages installed at runtime)
+
+FROM base AS builder
 
 # Set working directory
 WORKDIR /app
@@ -20,10 +24,7 @@ COPY . .
 RUN npm run build
 
 # Production stage
-FROM node:18-alpine
-
-# Install runtime dependencies
-RUN apk add --no-cache python3 make g++
+FROM base
 
 # Set working directory
 WORKDIR /app
@@ -35,15 +36,17 @@ COPY package*.json ./
 RUN npm ci --only=production
 
 # Copy built application
-COPY --from=base /app/dist ./dist
-COPY --from=base /app/server ./server
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server ./server
 
-# Expose port
-EXPOSE 3000
+
 
 # Set environment variables
 ENV NODE_ENV=production
 ENV PORT=3000
+
+# Expose port
+EXPOSE 3000
 
 # Start the application
 CMD ["node", "server/index.js"]
