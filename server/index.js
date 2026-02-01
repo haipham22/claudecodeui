@@ -58,7 +58,7 @@ import fetch from 'node-fetch';
 import mime from 'mime-types';
 
 import { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache } from './projects.js';
-import { queryClaudeSDK, abortClaudeSDKSession, isClaudeSDKSessionActive, getActiveClaudeSDKSessions } from './claude-sdk.js';
+import { queryClaudeSDK, abortClaudeSDKSession, isClaudeSDKSessionActive, getActiveClaudeSDKSessions, resolveToolApproval } from './claude-sdk.js';
 import { spawnCursor, abortCursorSession, isCursorSessionActive, getActiveCursorSessions } from './cursor-cli.js';
 import { queryCodex, abortCodexSession, isCodexSessionActive, getActiveCodexSessions } from './openai-codex.js';
 import gitRoutes from './routes/git.js';
@@ -70,7 +70,7 @@ import mcpUtilsRoutes from './routes/mcp-utils.js';
 import commandsRoutes from './routes/commands.js';
 import settingsRoutes from './routes/settings.js';
 import agentRoutes from './routes/agent.js';
-import projectsRoutes from './routes/projects.js';
+import projectsRoutes, { WORKSPACES_ROOT, validateWorkspacePath } from './routes/projects.js';
 import cliAuthRoutes from './routes/cli-auth.js';
 import userRoutes from './routes/user.js';
 import codexRoutes from './routes/codex.js';
@@ -80,6 +80,20 @@ import { validateApiKey, authenticateToken, authenticateWebSocket } from './midd
 // File system watcher for projects folder
 let projectsWatcher = null;
 const connectedClients = new Set();
+let isGetProjectsRunning = false; // Flag to prevent reentrant calls
+
+// Broadcast progress to all connected WebSocket clients
+function broadcastProgress(progress) {
+    const message = JSON.stringify({
+        type: 'loading_progress',
+        ...progress
+    });
+    connectedClients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
 
 // Setup file system watcher for Claude projects folder using chokidar
 async function setupProjectsWatcher() {
@@ -117,13 +131,19 @@ async function setupProjectsWatcher() {
         const debouncedUpdate = async (eventType, filePath) => {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(async () => {
+                // Prevent reentrant calls
+                if (isGetProjectsRunning) {
+                    return;
+                }
+
                 try {
+                    isGetProjectsRunning = true;
 
                     // Clear project directory cache when files change
                     clearProjectDirectoryCache();
 
                     // Get updated projects list
-                    const updatedProjects = await getProjects();
+                    const updatedProjects = await getProjects(broadcastProgress);
 
                     // Notify all connected clients about the project changes
                     const updateMessage = JSON.stringify({
@@ -142,6 +162,8 @@ async function setupProjectsWatcher() {
 
                 } catch (error) {
                     console.error('[ERROR] Error handling project changes:', error);
+                } finally {
+                    isGetProjectsRunning = false;
                 }
             }, 300); // 300ms debounce (slightly faster than before)
         };
@@ -366,7 +388,7 @@ app.post('/api/system/update', authenticateToken, async (req, res) => {
 
 app.get('/api/projects', authenticateToken, async (req, res) => {
     try {
-        const projects = await getProjects();
+        const projects = await getProjects(broadcastProgress);
         res.json(projects);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -433,11 +455,12 @@ app.delete('/api/projects/:projectName/sessions/:sessionId', authenticateToken, 
     }
 });
 
-// Delete project endpoint (only if empty)
+// Delete project endpoint (force=true to delete with sessions)
 app.delete('/api/projects/:projectName', authenticateToken, async (req, res) => {
     try {
         const { projectName } = req.params;
-        await deleteProject(projectName);
+        const force = req.query.force === 'true';
+        await deleteProject(projectName, force);
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -461,22 +484,42 @@ app.post('/api/projects/create', authenticateToken, async (req, res) => {
     }
 });
 
+const expandWorkspacePath = (inputPath) => {
+    if (!inputPath) return inputPath;
+    if (inputPath === '~') {
+        return WORKSPACES_ROOT;
+    }
+    if (inputPath.startsWith('~/') || inputPath.startsWith('~\\')) {
+        return path.join(WORKSPACES_ROOT, inputPath.slice(2));
+    }
+    return inputPath;
+};
+
 // Browse filesystem endpoint for project suggestions - uses existing getFileTree
 app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
     try {
         const { path: dirPath } = req.query;
         
+        console.log('[API] Browse filesystem request for path:', dirPath);
+        console.log('[API] WORKSPACES_ROOT is:', WORKSPACES_ROOT);
         // Default to home directory if no path provided
-        const homeDir = os.homedir();
-        let targetPath = dirPath ? dirPath.replace('~', homeDir) : homeDir;
+        const defaultRoot = WORKSPACES_ROOT;
+        let targetPath = dirPath ? expandWorkspacePath(dirPath) : defaultRoot;
         
         // Resolve and normalize the path
         targetPath = path.resolve(targetPath);
+
+        // Security check - ensure path is within allowed workspace root
+        const validation = await validateWorkspacePath(targetPath);
+        if (!validation.valid) {
+            return res.status(403).json({ error: validation.error });
+        }
+        const resolvedPath = validation.resolvedPath || targetPath;
         
         // Security check - ensure path is accessible
         try {
-            await fs.promises.access(targetPath);
-            const stats = await fs.promises.stat(targetPath);
+            await fs.promises.access(resolvedPath);
+            const stats = await fs.promises.stat(resolvedPath);
             
             if (!stats.isDirectory()) {
                 return res.status(400).json({ error: 'Path is not a directory' });
@@ -486,7 +529,7 @@ app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
         }
         
         // Use existing getFileTree function with shallow depth (only direct children)
-        const fileTree = await getFileTree(targetPath, 1, 0, false); // maxDepth=1, showHidden=false
+        const fileTree = await getFileTree(resolvedPath, 1, 0, false); // maxDepth=1, showHidden=false
         
         // Filter only directories and format for suggestions
         const directories = fileTree
@@ -496,11 +539,23 @@ app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
                 name: item.name,
                 type: 'directory'
             }))
-            .slice(0, 20); // Limit results
+            .sort((a, b) => {
+                const aHidden = a.name.startsWith('.');
+                const bHidden = b.name.startsWith('.');
+                if (aHidden && !bHidden) return 1;
+                if (!aHidden && bHidden) return -1;
+                return a.name.localeCompare(b.name);
+            });
             
         // Add common directories if browsing home directory
         const suggestions = [];
-        if (targetPath === homeDir) {
+        let resolvedWorkspaceRoot = defaultRoot;
+        try {
+            resolvedWorkspaceRoot = await fsPromises.realpath(defaultRoot);
+        } catch (error) {
+            // Use default root as-is if realpath fails
+        }
+        if (resolvedPath === resolvedWorkspaceRoot) {
             const commonDirs = ['Desktop', 'Documents', 'Projects', 'Development', 'Dev', 'Code', 'workspace'];
             const existingCommon = directories.filter(dir => commonDirs.includes(dir.name));
             const otherDirs = directories.filter(dir => !commonDirs.includes(dir.name));
@@ -511,13 +566,53 @@ app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
         }
         
         res.json({
-            path: targetPath,
+            path: resolvedPath,
             suggestions: suggestions
         });
         
     } catch (error) {
         console.error('Error browsing filesystem:', error);
         res.status(500).json({ error: 'Failed to browse filesystem' });
+    }
+});
+
+app.post('/api/create-folder', authenticateToken, async (req, res) => {
+    try {
+        const { path: folderPath } = req.body;
+        if (!folderPath) {
+            return res.status(400).json({ error: 'Path is required' });
+        }
+        const expandedPath = expandWorkspacePath(folderPath);
+        const resolvedInput = path.resolve(expandedPath);
+        const validation = await validateWorkspacePath(resolvedInput);
+        if (!validation.valid) {
+            return res.status(403).json({ error: validation.error });
+        }
+        const targetPath = validation.resolvedPath || resolvedInput;
+        const parentDir = path.dirname(targetPath);
+        try {
+            await fs.promises.access(parentDir);
+        } catch (err) {
+            return res.status(404).json({ error: 'Parent directory does not exist' });
+        }
+        try {
+            await fs.promises.access(targetPath);
+            return res.status(409).json({ error: 'Folder already exists' });
+        } catch (err) {
+            // Folder doesn't exist, which is what we want
+        }
+        try {
+            await fs.promises.mkdir(targetPath, { recursive: false });
+            res.json({ success: true, path: targetPath });
+        } catch (mkdirError) {
+            if (mkdirError.code === 'EEXIST') {
+                return res.status(409).json({ error: 'Folder already exists' });
+            }
+            throw mkdirError;
+        }
+    } catch (error) {
+        console.error('Error creating folder:', error);
+        res.status(500).json({ error: 'Failed to create folder' });
     }
 });
 
@@ -804,6 +899,18 @@ function handleChatConnection(ws) {
                     provider,
                     success
                 });
+            } else if (data.type === 'claude-permission-response') {
+                // Relay UI approval decisions back into the SDK control flow.
+                // This does not persist permissions; it only resolves the in-flight request,
+                // introduced so the SDK can resume once the user clicks Allow/Deny.
+                if (data.requestId) {
+                    resolveToolApproval(data.requestId, {
+                        allow: Boolean(data.allow),
+                        updatedInput: data.updatedInput,
+                        message: data.message,
+                        rememberEntry: data.rememberEntry
+                    });
+                }
             } else if (data.type === 'cursor-abort') {
                 console.log('[DEBUG] Abort Cursor session:', data.sessionId);
                 const success = abortCursorSession(data.sessionId);
@@ -1625,10 +1732,13 @@ async function getFileTree(dirPath, maxDepth = 3, currentDepth = 0, showHidden =
             // Debug: log all entries including hidden files
 
 
-            // Skip only heavy build directories
+            // Skip heavy build directories and VCS directories
             if (entry.name === 'node_modules' ||
                 entry.name === 'dist' ||
-                entry.name === 'build') continue;
+                entry.name === 'build' ||
+                entry.name === '.git' ||
+                entry.name === '.svn' ||
+                entry.name === '.hg') continue;
 
             const itemPath = path.join(dirPath, entry.name);
             const item = {

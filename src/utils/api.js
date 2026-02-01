@@ -79,8 +79,8 @@ export const api = {
     authenticatedFetch(`/api/codex/sessions/${sessionId}`, {
       method: 'DELETE',
     }),
-  deleteProject: (projectName) =>
-    authenticatedFetch(`/api/projects/${projectName}`, {
+  deleteProject: (projectName, force = false) =>
+    authenticatedFetch(`/api/projects/${projectName}${force ? '?force=true' : ''}`, {
       method: 'DELETE',
     }),
   createProject: (path) =>
@@ -157,6 +157,12 @@ export const api = {
 
     return authenticatedFetch(`/api/browse-filesystem?${params}`);
   },
+
+  createFolder: (folderPath) =>
+    authenticatedFetch('/api/create-folder', {
+      method: 'POST',
+      body: JSON.stringify({ path: folderPath }),
+    }),
 
   // User endpoints
   user: {
