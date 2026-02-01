@@ -14,6 +14,9 @@ WORKDIR /app
 # Copy package.json and package-lock.json (if exists)
 COPY package*.json ./
 
+# Install task-master-ai as global
+RUN npm i -g task-master-ai
+
 # Install all dependencies (including dev for build)
 RUN npm ci
 
